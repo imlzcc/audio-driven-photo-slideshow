@@ -34,7 +34,8 @@ class VideoGenerationWorker(QThread):
                  resolution: tuple | None = None, fps: int = 24, preset: str = "ultrafast",
                  crf: int = 23, threads: int | None = None, processed_folder: str | None = None,
                  video_clip_folder: str | None = None, enable_video_clips: bool = False, 
-                 video_clip_count: int = 3, video_clip_scale_mode: str = "crop"):
+                 video_clip_count: int = 3, video_clip_scale_mode: str = "crop",
+                 processed_video_folder: str | None = None):
         super().__init__()
         self.image_folder = image_folder
         self.audio_file = audio_file
@@ -52,6 +53,7 @@ class VideoGenerationWorker(QThread):
         self.enable_video_clips = enable_video_clips
         self.video_clip_count = video_clip_count
         self.video_clip_scale_mode = video_clip_scale_mode
+        self.processed_video_folder = processed_video_folder
         
         # 支持的图片格式
         self.image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
@@ -61,6 +63,9 @@ class VideoGenerationWorker(QThread):
         
         # 跟踪实际处理的图片
         self.actually_processed_images = []
+        
+        # 跟踪实际处理的视频片段
+        self.actually_processed_videos = []
         
         # 线程控制
         self._is_running = True
@@ -311,6 +316,10 @@ class VideoGenerationWorker(QThread):
             if self.processed_folder and os.path.exists(self.processed_folder):
                 self.move_processed_images()
             
+            # 移动已处理的视频片段到指定文件夹
+            if self.processed_video_folder and os.path.exists(self.processed_video_folder):
+                self.move_processed_videos()
+            
             self.status_updated.emit("完成！")
             self.progress_updated.emit(100)
             self.log_updated.emit("=== 视频生成完成 ===")
@@ -366,6 +375,52 @@ class VideoGenerationWorker(QThread):
             
         except Exception as e:
             self.log_updated.emit(f"✗ 移动已处理图片失败: {str(e)}")
+    
+    def move_processed_videos(self):
+        """移动已处理的视频片段到已处理视频片段文件夹"""
+        try:
+            self.log_updated.emit("步骤9: 移动已处理视频片段...")
+            self.status_updated.emit("移动已处理视频片段...")
+            
+            # 只移动实际处理的视频片段
+            processed_videos = self.actually_processed_videos
+            
+            if not processed_videos:
+                self.log_updated.emit("没有找到需要移动的已处理视频片段文件")
+                return
+            
+            # 确保已处理视频片段文件夹存在
+            if not os.path.exists(self.processed_video_folder):
+                os.makedirs(self.processed_video_folder)
+                self.log_updated.emit(f"创建已处理视频片段文件夹: {self.processed_video_folder}")
+            
+            moved_count = 0
+            for video_path in processed_videos:
+                try:
+                    filename = os.path.basename(video_path)
+                    destination = os.path.join(self.processed_video_folder, filename)
+                    
+                    # 如果目标文件已存在，添加时间戳
+                    if os.path.exists(destination):
+                        name, ext = os.path.splitext(filename)
+                        timestamp = int(time.time())
+                        filename = f"{name}_{timestamp}{ext}"
+                        destination = os.path.join(self.processed_video_folder, filename)
+                    
+                    # 移动文件
+                    shutil.move(video_path, destination)
+                    moved_count += 1
+                    self.log_updated.emit(f"✓ 已移动: {filename}")
+                    
+                except Exception as e:
+                    self.log_updated.emit(f"✗ 移动失败 {os.path.basename(video_path)}: {str(e)}")
+                    continue
+            
+            self.log_updated.emit(f"✓ 已移动 {moved_count} 个已处理的视频片段到已处理视频片段文件夹")
+            self.log_updated.emit(f"总共处理了 {len(self.actually_processed_videos)} 个视频片段，移动了 {moved_count} 个")
+            
+        except Exception as e:
+            self.log_updated.emit(f"✗ 移动已处理视频片段失败: {str(e)}")
     
     def get_video_clips(self):
         """获取视频片段文件列表"""
@@ -557,6 +612,9 @@ class VideoGenerationWorker(QThread):
                     if self.resolution:
                         video_clip = self._adjust_video_clip_resolution(video_clip)
                     
+                    # 跟踪实际处理的视频片段
+                    self.actually_processed_videos.append(data['path'])
+                    
                     all_segments.append({
                         'type': 'video',
                         'clip': video_clip,
@@ -689,6 +747,7 @@ class MainWindow(QMainWindow):
         self.selected_processed_folder = None
         self.selected_output_folder = None
         self.selected_video_clip_folder = None
+        self.selected_processed_video_folder = None
         
         # 处理模式
         self.processing_mode = "single"  # "single" 或 "batch"
@@ -753,6 +812,10 @@ class MainWindow(QMainWindow):
         if self.config.get("video_clip_folder"):
             self.selected_video_clip_folder = self.config["video_clip_folder"]
             self.video_clip_folder_label.setText(f"已选择: {os.path.basename(self.selected_video_clip_folder)}")
+        
+        if self.config.get("processed_video_folder"):
+            self.selected_processed_video_folder = self.config["processed_video_folder"]
+            self.processed_video_folder_label.setText(f"已选择: {os.path.basename(self.selected_processed_video_folder)}")
         
         # 加载视频片段设置
         self.enable_video_clips = self.config.get("enable_video_clips", False)
@@ -841,6 +904,7 @@ class MainWindow(QMainWindow):
             "processed_folder": self.selected_processed_folder or "",
             "output_folder": self.selected_output_folder or "",
             "video_clip_folder": self.selected_video_clip_folder or "",
+            "processed_video_folder": self.selected_processed_video_folder or "",
             "processing_mode": self.processing_mode,
             "enable_video_clips": self.enable_video_clips,
             "video_clip_count": self.video_clip_count,
@@ -1055,6 +1119,18 @@ class MainWindow(QMainWindow):
         processed_layout.addWidget(self.processed_btn)
         processed_layout.addWidget(self.processed_folder_label, 1)
         layout.addLayout(processed_layout)
+        
+        # 已处理视频片段文件夹选择
+        processed_video_layout = QHBoxLayout()
+        self.processed_video_btn = QPushButton("选择已处理视频片段文件夹")
+        self.processed_video_btn.clicked.connect(self.select_processed_video_folder)
+        self.processed_video_folder_label = QLabel("未选择已处理视频片段文件夹")
+        self.processed_video_folder_label.setWordWrap(True)
+        self.processed_video_folder_label.setStyleSheet("color: #666; font-style: italic;")
+        
+        processed_video_layout.addWidget(self.processed_video_btn)
+        processed_video_layout.addWidget(self.processed_video_folder_label, 1)
+        layout.addLayout(processed_video_layout)
         
         return group
     
@@ -1562,6 +1638,21 @@ class MainWindow(QMainWindow):
             
             # 自动保存配置
             self.config_manager.update_config(output_folder=folder_path)
+    
+    def select_processed_video_folder(self):
+        """选择已处理视频片段文件夹"""
+        folder_path = QFileDialog.getExistingDirectory(
+            self, 
+            "选择已处理视频片段文件夹"
+        )
+        
+        if folder_path:
+            self.selected_processed_video_folder = folder_path
+            self.processed_video_folder_label.setText(f"已选择: {os.path.basename(folder_path)}")
+            self.processed_video_folder_label.setStyleSheet("color: #333; font-style: normal;")
+            
+            # 自动保存配置
+            self.config_manager.update_config(processed_video_folder=folder_path)
             
     def reset_config(self):
         """重置配置为默认值"""
@@ -1584,6 +1675,7 @@ class MainWindow(QMainWindow):
             self.selected_processed_folder = None
             self.selected_output_folder = None
             self.selected_video_clip_folder = None
+            self.selected_processed_video_folder = None
             self.processing_mode = "single"
             self.enable_video_clips = False
             self.video_clip_count = 3
@@ -1601,6 +1693,8 @@ class MainWindow(QMainWindow):
             self.output_folder_label.setStyleSheet("color: #999; font-style: italic;")
             self.video_clip_folder_label.setText("未选择视频片段文件夹")
             self.video_clip_folder_label.setStyleSheet("color: #999; font-style: italic;")
+            self.processed_video_folder_label.setText("未选择已处理视频片段文件夹")
+            self.processed_video_folder_label.setStyleSheet("color: #999; font-style: italic;")
             
             # 重置处理模式按钮
             self.single_mode_btn.setChecked(True)
@@ -1817,7 +1911,8 @@ class MainWindow(QMainWindow):
             self.selected_video_clip_folder,
             self.enable_video_clips,
             int(self.video_clip_count_spin.value()),
-            self.video_clip_scale_mode
+            self.video_clip_scale_mode,
+            self.selected_processed_video_folder
         )
         
         # 连接信号
