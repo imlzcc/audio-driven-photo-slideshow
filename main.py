@@ -32,7 +32,9 @@ class VideoGenerationWorker(QThread):
     def __init__(self, image_folder: str, audio_file: str, image_duration: float | tuple, 
                  animation_effect: str, output_path: str, animation_intensity: float = 1.0,
                  resolution: tuple | None = None, fps: int = 24, preset: str = "ultrafast",
-                 crf: int = 23, threads: int | None = None, processed_folder: str | None = None):
+                 crf: int = 23, threads: int | None = None, processed_folder: str | None = None,
+                 video_clip_folder: str | None = None, enable_video_clips: bool = False, 
+                 video_clip_count: int = 3, video_clip_scale_mode: str = "crop"):
         super().__init__()
         self.image_folder = image_folder
         self.audio_file = audio_file
@@ -46,9 +48,16 @@ class VideoGenerationWorker(QThread):
         self.crf = crf
         self.threads = threads if threads and threads > 0 else max(1, (os.cpu_count() or 2) - 1)
         self.processed_folder = processed_folder
+        self.video_clip_folder = video_clip_folder
+        self.enable_video_clips = enable_video_clips
+        self.video_clip_count = video_clip_count
+        self.video_clip_scale_mode = video_clip_scale_mode
         
         # 支持的图片格式
         self.image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
+        
+        # 支持的视频格式
+        self.video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm'}
         
         # 跟踪实际处理的图片
         self.actually_processed_images = []
@@ -122,19 +131,27 @@ class VideoGenerationWorker(QThread):
             self.log_updated.emit(f"预计处理 {len(image_files)} 张图片，每张 {self.image_duration} 秒")
             self.progress_updated.emit(20)
             
+            # 如果启用了视频片段插入，需要预留时间
+            available_duration = audio_duration
+            if self.enable_video_clips:
+                # 估算视频片段需要的总时长（假设每个视频片段平均8秒）
+                estimated_video_clips_duration = self.video_clip_count * 8.0
+                available_duration = audio_duration - estimated_video_clips_duration
+                self.log_updated.emit(f"为视频片段预留时间: {estimated_video_clips_duration:.1f}s, 图片可用时长: {available_duration:.1f}s")
+            
             clips = []
             current_video_duration = 0.0
             total_images = len(image_files)
             processed_count = 0
             
             for i, image_path in enumerate(image_files):
-                # 检查时长上限
-                if current_video_duration >= audio_duration:
-                    self.log_updated.emit(f"已达到音频时长上限，停止处理剩余图片")
+                # 检查时长上限（使用可用时长而不是音频时长）
+                if current_video_duration >= available_duration:
+                    self.log_updated.emit(f"已达到图片可用时长上限，停止处理剩余图片")
                     break
                 
                 # 计算当前片段时长（范围内随机）
-                remaining_time = audio_duration - current_video_duration
+                remaining_time = available_duration - current_video_duration
                 if isinstance(self.image_duration, tuple):
                     dmin, dmax = self.image_duration
                     rnd = random.random()
@@ -191,9 +208,27 @@ class VideoGenerationWorker(QThread):
             self.log_updated.emit(f"✓ 视频片段创建完成，共处理 {processed_count} 张图片")
             self.log_updated.emit(f"总视频时长: {current_video_duration:.1f}s")
             
-            # 步骤5: 最终视频合成
+            # 步骤5: 插入视频片段
+            if self.enable_video_clips:
+                self.status_updated.emit("插入视频片段...")
+                self.log_updated.emit("步骤5: 插入视频片段...")
+                self.progress_updated.emit(80)
+                clips = self.insert_video_clips(clips, audio_duration, image_files)
+                
+                # 重新计算视频总时长
+                new_video_duration = sum(clip.duration for clip in clips)
+                self.log_updated.emit(f"插入视频片段后，总时长: {new_video_duration:.2f}s")
+                
+                # 如果视频时长超过音频时长，给出警告
+                if new_video_duration > audio_duration:
+                    self.log_updated.emit(f"警告: 插入视频片段后，视频时长({new_video_duration:.2f}s)超过音频时长({audio_duration:.2f}s)")
+                    self.log_updated.emit("系统将循环播放音频以匹配视频长度")
+                
+                self.log_updated.emit("✓ 视频片段插入完成")
+            
+            # 步骤6: 最终视频合成
             self.status_updated.emit("合成视频...")
-            self.log_updated.emit("步骤5: 合成视频...")
+            self.log_updated.emit("步骤6: 合成视频...")
             self.progress_updated.emit(85)
             
             # 拼接视频片段
@@ -208,18 +243,41 @@ class VideoGenerationWorker(QThread):
             
             # 精确同步音频
             self.status_updated.emit("同步音频...")
-            self.log_updated.emit("步骤6: 同步音频...")
+            self.log_updated.emit("步骤7: 同步音频...")
             self.progress_updated.emit(90)
             
             # 将音频剪辑到与视频相同的长度
             self.log_updated.emit("正在同步音频到视频长度...")
-            synced_audio = audio_clip.subclip(0, final_video_duration)
-            final_video = final_video.set_audio(synced_audio)
-            self.log_updated.emit("✓ 音频同步完成")
+            self.log_updated.emit(f"音频时长: {audio_clip.duration:.2f}s, 视频时长: {final_video_duration:.2f}s")
             
-            # 步骤7: 导出视频
+            # 处理音频和视频时长不匹配的情况
+            if final_video_duration > audio_clip.duration:
+                # 视频比音频长，需要循环播放音频
+                self.log_updated.emit(f"视频时长({final_video_duration:.2f}s)超过音频时长({audio_clip.duration:.2f}s)，将循环播放音频")
+                
+                # 计算需要循环的次数
+                loops_needed = int(final_video_duration / audio_clip.duration) + 1
+                self.log_updated.emit(f"需要循环播放 {loops_needed} 次音频")
+                
+                # 创建循环音频
+                audio_clips = [audio_clip] * loops_needed
+                from moviepy.editor import concatenate_audioclips
+                looped_audio = concatenate_audioclips(audio_clips)
+                
+                # 剪辑到视频长度
+                synced_audio = looped_audio.subclip(0, final_video_duration)
+                final_video = final_video.set_audio(synced_audio)
+                self.log_updated.emit(f"✓ 音频循环播放完成，最终时长: {final_video_duration:.2f}s")
+                
+            else:
+                # 视频比音频短或相等，直接剪辑音频
+                synced_audio = audio_clip.subclip(0, final_video_duration)
+                final_video = final_video.set_audio(synced_audio)
+                self.log_updated.emit(f"✓ 音频同步完成，同步时长: {final_video_duration:.2f}s")
+            
+            # 步骤8: 导出视频
             self.status_updated.emit("导出视频中...")
-            self.log_updated.emit("步骤7: 导出视频...")
+            self.log_updated.emit("步骤8: 导出视频...")
             self.log_updated.emit(f"正在导出到: {self.output_path}")
             self.log_updated.emit("注意: 导出过程可能需要较长时间，请耐心等待...")
             self.progress_updated.emit(95)
@@ -309,6 +367,300 @@ class VideoGenerationWorker(QThread):
         except Exception as e:
             self.log_updated.emit(f"✗ 移动已处理图片失败: {str(e)}")
     
+    def get_video_clips(self):
+        """获取视频片段文件列表"""
+        if not self.enable_video_clips or not self.video_clip_folder or not os.path.exists(self.video_clip_folder):
+            return []
+        
+        video_clips = []
+        for file in os.listdir(self.video_clip_folder):
+            if any(file.lower().endswith(ext) for ext in self.video_extensions):
+                video_clips.append(os.path.join(self.video_clip_folder, file))
+        
+        # 随机选择指定数量的视频片段
+        if len(video_clips) > self.video_clip_count:
+            video_clips = random.sample(video_clips, self.video_clip_count)
+        
+        return sorted(video_clips)
+    
+    def insert_video_clips(self, clips, audio_duration, image_files):
+        """在视频片段中插入视频片段 - 按照用户建议的简单逻辑"""
+        if not self.enable_video_clips or not clips:
+            return clips
+        
+        video_clips = self.get_video_clips()
+        if not video_clips:
+            self.log_updated.emit("没有找到可用的视频片段")
+            return clips
+        
+        self.log_updated.emit(f"找到 {len(video_clips)} 个视频片段，准备插入")
+        
+        try:
+            from moviepy.editor import VideoFileClip
+            
+            # 第一步：获取音频时长
+            self.log_updated.emit(f"音频时长: {audio_duration:.1f}s")
+            
+            # 第二步：获取三个视频片段时长
+            video_clip_data = []
+            total_video_duration = 0
+            
+            for video_path in video_clips:
+                try:
+                    video_clip = VideoFileClip(video_path)
+                    video_clip = video_clip.without_audio()
+                    
+                    # 保持视频片段完整，但限制最大时长
+                    original_duration = video_clip.duration
+                    max_allowed_duration = 15.0
+                    min_allowed_duration = 1.0
+                    
+                    if original_duration > max_allowed_duration:
+                        start_time = (original_duration - max_allowed_duration) / 2
+                        video_clip = video_clip.subclip(start_time, start_time + max_allowed_duration)
+                        actual_duration = max_allowed_duration
+                        self.log_updated.emit(f"视频片段过长，从中间截取: {os.path.basename(video_path)} ({original_duration:.1f}s -> {actual_duration:.1f}s)")
+                    elif original_duration < min_allowed_duration:
+                        loops_needed = int(min_allowed_duration / original_duration) + 1
+                        video_clips_loop = [video_clip] * loops_needed
+                        video_clip = concatenate_videoclips(video_clips_loop).subclip(0, min_allowed_duration)
+                        actual_duration = min_allowed_duration
+                        self.log_updated.emit(f"视频片段过短，循环播放: {os.path.basename(video_path)} ({original_duration:.1f}s -> {actual_duration:.1f}s)")
+                    else:
+                        actual_duration = original_duration
+                        self.log_updated.emit(f"视频片段时长合适: {os.path.basename(video_path)} ({actual_duration:.1f}s)")
+                    
+                    video_clip_data.append({
+                        'clip': video_clip,
+                        'duration': actual_duration,
+                        'path': video_path
+                    })
+                    total_video_duration += actual_duration
+                    
+                except Exception as e:
+                    self.log_updated.emit(f"✗ 加载视频片段失败 {os.path.basename(video_path)}: {str(e)}")
+                    continue
+            
+            if not video_clip_data:
+                self.log_updated.emit("没有成功加载任何视频片段")
+                return clips
+            
+            self.log_updated.emit(f"视频片段总时长: {total_video_duration:.1f}s")
+            
+            # 第三步：计算差值
+            remaining_time = audio_duration - total_video_duration
+            self.log_updated.emit(f"剩余时间给图片: {remaining_time:.1f}s")
+            
+            if remaining_time <= 0:
+                self.log_updated.emit(f"警告: 视频片段总时长({total_video_duration:.1f}s)超过音频时长({audio_duration:.1f}s)")
+                remaining_time = audio_duration * 0.1
+                self.log_updated.emit(f"调整后剩余时间: {remaining_time:.1f}s")
+            
+            # 第四步：根据剩余时间重新生成图片片段
+            self.log_updated.emit(f"使用剩余时长 {remaining_time:.1f}s 重新生成图片片段")
+            
+            # 清空现有图片片段
+            clips = []
+            
+            # 根据剩余时间和图片时长范围计算能放多少张图片
+            if isinstance(self.image_duration, tuple):
+                dmin, dmax = self.image_duration
+            else:
+                dmin = dmax = float(self.image_duration)
+            
+            self.log_updated.emit(f"图片时长范围: {dmin}-{dmax}s, 剩余时间: {remaining_time:.1f}s")
+            
+            # 计算能放多少张图片
+            if dmin <= 0:
+                self.log_updated.emit(f"错误: 图片最小时长({dmin})必须大于0")
+                max_images = 0
+            else:
+                max_images = int(remaining_time / dmin)
+                self.log_updated.emit(f"最多可放: {max_images}张图片")
+            
+            if max_images > 0 and len(image_files) > 0:
+                # 重新生成图片片段，使用剩余时间
+                current_time = 0.0
+                for i in range(min(max_images, len(image_files))):
+                    # 计算当前片段时长
+                    remaining_for_this_image = remaining_time - current_time
+                    if remaining_for_this_image <= 0:
+                        break
+                    
+                    # 在范围内随机，但不超过剩余时间
+                    if isinstance(self.image_duration, tuple):
+                        rnd = random.random()
+                        desired = dmin + (dmax - dmin) * rnd
+                    else:
+                        desired = float(self.image_duration)
+                    
+                    self.log_updated.emit(f"计算图片片段{i+1}: desired={desired:.1f}s, remaining={remaining_for_this_image:.1f}s")
+                    
+                    if desired <= 0 or remaining_for_this_image <= 0:
+                        self.log_updated.emit(f"跳过图片片段{i+1}: desired={desired:.1f}s, remaining={remaining_for_this_image:.1f}s")
+                        break
+                    
+                    clip_duration = min(desired, remaining_for_this_image)
+                    
+                    if clip_duration <= 0:
+                        break
+                    
+                    try:
+                        # 选择动画效果
+                        effect = self.animation_effect
+                        if effect == "随机效果":
+                            effects = ['Slow Zoom In', 'Slow Zoom Out', 'Pan Left to Right', 'Pan Right to Left']
+                            effect = random.choice(effects)
+                        
+                        # 创建图片片段
+                        clip = create_animated_clip(
+                            image_files[i], 
+                            clip_duration, 
+                            effect, 
+                            self.animation_intensity,
+                            self.resolution
+                        )
+                        
+                        clips.append(clip)
+                        current_time += clip_duration
+                        self.log_updated.emit(f"重新生成图片片段{i+1}: {os.path.basename(image_files[i])}, 时长={clip_duration:.1f}s")
+                        
+                    except Exception as e:
+                        self.log_updated.emit(f"重新生成图片片段失败 {os.path.basename(image_files[i])}: {str(e)}")
+                        break
+                
+                # 验证重新生成后的总时长
+                total_image_duration = sum(clip.duration for clip in clips)
+                self.log_updated.emit(f"重新生成后图片片段总时长: {total_image_duration:.1f}s")
+            else:
+                self.log_updated.emit(f"剩余时间不足，无法生成图片片段")
+            
+            # 第六步：创建最终视频序列 - 随机穿插图片和视频片段
+            final_clips = []
+            
+            # 创建所有片段的列表（图片 + 视频）
+            all_segments = []
+            
+            # 添加图片片段
+            for i, clip in enumerate(clips):
+                all_segments.append({
+                    'type': 'image',
+                    'clip': clip,
+                    'duration': clip.duration,
+                    'name': f'图片片段{i+1}'
+                })
+            
+            # 添加视频片段
+            for i, data in enumerate(video_clip_data):
+                try:
+                    video_clip = data['clip']
+                    if self.resolution:
+                        video_clip = self._adjust_video_clip_resolution(video_clip)
+                    
+                    all_segments.append({
+                        'type': 'video',
+                        'clip': video_clip,
+                        'duration': data['duration'],
+                        'name': f'视频片段{i+1}: {os.path.basename(data["path"])}'
+                    })
+                    
+                except Exception as e:
+                    self.log_updated.emit(f"✗ 处理视频片段失败 {os.path.basename(data['path'])}: {str(e)}")
+            
+            # 随机打乱片段顺序
+            random.shuffle(all_segments)
+            self.log_updated.emit(f"随机打乱片段顺序，共 {len(all_segments)} 个片段")
+            
+            # 按顺序添加所有片段
+            for i, segment in enumerate(all_segments):
+                final_clips.append(segment['clip'])
+                self.log_updated.emit(f"✓ 添加{segment['name']}: 时长={segment['duration']:.1f}s")
+            
+            # 计算最终总时长
+            total_duration = sum(clip.duration for clip in final_clips)
+            self.log_updated.emit(f"最终视频总时长: {total_duration:.1f}s (目标音频时长: {audio_duration:.1f}s)")
+            
+            if abs(total_duration - audio_duration) > 0.1:
+                self.log_updated.emit(f"警告: 视频时长({total_duration:.1f}s)与音频时长({audio_duration:.1f}s)不匹配！")
+            
+            return final_clips
+            
+        except Exception as e:
+            self.log_updated.emit(f"✗ 视频片段插入失败: {str(e)}")
+            return clips
+    
+    def _adjust_video_clip_resolution(self, video_clip):
+        """调整视频片段分辨率"""
+        if not self.resolution:
+            return video_clip
+            
+        target_width, target_height = self.resolution
+        original_width, original_height = video_clip.size
+        
+        # 如果尺寸已经匹配，无需调整
+        if original_width == target_width and original_height == target_height:
+            self.log_updated.emit(f"视频片段尺寸已匹配: {original_width}x{original_height}")
+            return video_clip
+        
+        # 根据缩放模式处理
+        if self.video_clip_scale_mode == "stretch":
+            # 拉伸模式：强制调整到目标尺寸（可能变形）
+            video_clip = video_clip.resize((target_width, target_height))
+            self.log_updated.emit(f"拉伸视频片段: {original_width}x{original_height} -> {target_width}x{target_height}")
+            
+        elif self.video_clip_scale_mode == "fit":
+            # 适应模式：保持比例，添加黑边
+            width_ratio = target_width / original_width
+            height_ratio = target_height / original_height
+            scale_ratio = min(width_ratio, height_ratio)  # 选择较小的比例
+            
+            new_width = int(original_width * scale_ratio)
+            new_height = int(original_height * scale_ratio)
+            
+            # 缩放到合适尺寸
+            video_clip = video_clip.resize((new_width, new_height))
+            
+            # 如果尺寸不匹配，添加黑边
+            if new_width != target_width or new_height != target_height:
+                # 创建黑色背景
+                from moviepy.editor import ColorClip, CompositeVideoClip
+                background = ColorClip(size=(target_width, target_height), color=(0, 0, 0), duration=video_clip.duration)
+                
+                # 计算居中位置
+                x_offset = (target_width - new_width) // 2
+                y_offset = (target_height - new_height) // 2
+                
+                # 将视频片段合成到背景上
+                video_clip = CompositeVideoClip([background, video_clip.set_position((x_offset, y_offset))])
+            
+            self.log_updated.emit(f"适应模式调整: {original_width}x{original_height} -> {target_width}x{target_height} (保持比例)")
+            
+        else:  # crop 模式（默认）
+            # 裁剪模式：保持比例，居中裁剪
+            width_ratio = target_width / original_width
+            height_ratio = target_height / original_height
+            scale_ratio = max(width_ratio, height_ratio)  # 选择较大的比例确保填满目标尺寸
+            
+            new_width = int(original_width * scale_ratio)
+            new_height = int(original_height * scale_ratio)
+            
+            # 先缩放到合适尺寸
+            video_clip = video_clip.resize((new_width, new_height))
+            
+            # 居中裁剪到目标尺寸
+            x_center = new_width // 2
+            y_center = new_height // 2
+            x1 = x_center - target_width // 2
+            y1 = y_center - target_height // 2
+            x2 = x1 + target_width
+            y2 = y1 + target_height
+            
+            video_clip = video_clip.crop(x1=x1, y1=y1, x2=x2, y2=y2)
+            
+            self.log_updated.emit(f"裁剪模式调整: {original_width}x{original_height} -> {target_width}x{target_height} (保持比例)")
+        
+        return video_clip
+    
     def stop(self):
         """停止线程"""
         self._is_running = False
@@ -336,9 +688,15 @@ class MainWindow(QMainWindow):
         self.selected_audio_folder = None
         self.selected_processed_folder = None
         self.selected_output_folder = None
+        self.selected_video_clip_folder = None
         
         # 处理模式
         self.processing_mode = "single"  # "single" 或 "batch"
+        
+        # 视频片段设置
+        self.enable_video_clips = False
+        self.video_clip_count = 3
+        self.video_clip_scale_mode = "crop"  # "crop", "fit", "stretch"
         
         # 工作线程
         self.worker_thread = None
@@ -392,6 +750,60 @@ class MainWindow(QMainWindow):
             self.selected_output_folder = self.config["output_folder"]
             self.output_folder_label.setText(f"已选择: {os.path.basename(self.selected_output_folder)}")
         
+        if self.config.get("video_clip_folder"):
+            self.selected_video_clip_folder = self.config["video_clip_folder"]
+            self.video_clip_folder_label.setText(f"已选择: {os.path.basename(self.selected_video_clip_folder)}")
+        
+        # 加载视频片段设置
+        self.enable_video_clips = self.config.get("enable_video_clips", False)
+        self.video_clip_count = self.config.get("video_clip_count", 3)
+        self.video_clip_scale_mode = self.config.get("video_clip_scale_mode", "crop")
+        
+        # 更新视频片段UI状态
+        if hasattr(self, 'enable_video_clips_checkbox'):
+            self.enable_video_clips_checkbox.setChecked(self.enable_video_clips)
+            self.video_clip_count_spin.setEnabled(self.enable_video_clips)
+            self.video_clip_count_spin.setValue(self.video_clip_count)
+            
+            # 更新缩放模式下拉框
+            if hasattr(self, 'video_clip_scale_combo'):
+                if self.video_clip_scale_mode == "crop":
+                    self.video_clip_scale_combo.setCurrentText("裁剪模式 (保持比例)")
+                elif self.video_clip_scale_mode == "fit":
+                    self.video_clip_scale_combo.setCurrentText("适应模式 (添加黑边)")
+                elif self.video_clip_scale_mode == "stretch":
+                    self.video_clip_scale_combo.setCurrentText("拉伸模式 (可能变形)")
+            
+            # 更新按钮样式
+            if self.enable_video_clips:
+                self.enable_video_clips_checkbox.setStyleSheet("""
+                    QPushButton {
+                        background-color: #28a745;
+                        color: white;
+                        border: none;
+                        padding: 8px 16px;
+                        border-radius: 4px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #218838;
+                    }
+                """)
+            else:
+                self.enable_video_clips_checkbox.setStyleSheet("""
+                    QPushButton {
+                        background-color: #6c757d;
+                        color: white;
+                        border: none;
+                        padding: 8px 16px;
+                        border-radius: 4px;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #5a6268;
+                    }
+                """)
+        
         # 加载参数设置
         self.duration_min_spin.setValue(self.config.get("image_duration_min", 4.0))
         self.duration_max_spin.setValue(self.config.get("image_duration_max", 6.0))
@@ -428,7 +840,11 @@ class MainWindow(QMainWindow):
             "audio_folder": self.selected_audio_folder or "",
             "processed_folder": self.selected_processed_folder or "",
             "output_folder": self.selected_output_folder or "",
+            "video_clip_folder": self.selected_video_clip_folder or "",
             "processing_mode": self.processing_mode,
+            "enable_video_clips": self.enable_video_clips,
+            "video_clip_count": self.video_clip_count,
+            "video_clip_scale_mode": self.video_clip_scale_mode,
             "image_duration_min": self.duration_min_spin.value(),
             "image_duration_max": self.duration_max_spin.value(),
             "animation_effect": self.effect_combo.currentText(),
@@ -557,6 +973,56 @@ class MainWindow(QMainWindow):
         mode_layout.addWidget(self.batch_mode_btn)
         mode_layout.addStretch()
         layout.addLayout(mode_layout)
+        
+        # 视频片段设置
+        video_clip_layout = QHBoxLayout()
+        self.video_clip_btn = QPushButton("选择视频片段文件夹")
+        self.video_clip_btn.clicked.connect(self.select_video_clip_folder)
+        self.video_clip_folder_label = QLabel("未选择视频片段文件夹")
+        self.video_clip_folder_label.setWordWrap(True)
+        self.video_clip_folder_label.setStyleSheet("color: #666; font-style: italic;")
+        
+        video_clip_layout.addWidget(self.video_clip_btn)
+        video_clip_layout.addWidget(self.video_clip_folder_label, 1)
+        layout.addLayout(video_clip_layout)
+        
+        # 视频片段控制设置
+        video_clip_control_layout = QHBoxLayout()
+        
+        # 是否插入视频片段开关
+        self.enable_video_clips_checkbox = QPushButton("插入视频片段")
+        self.enable_video_clips_checkbox.setCheckable(True)
+        self.enable_video_clips_checkbox.setChecked(False)
+        self.enable_video_clips_checkbox.clicked.connect(self.toggle_video_clips)
+        
+        # 视频片段数量设置
+        clip_count_label = QLabel("插入数量:")
+        self.video_clip_count_spin = QDoubleSpinBox()
+        self.video_clip_count_spin.setRange(1, 10)
+        self.video_clip_count_spin.setDecimals(0)
+        self.video_clip_count_spin.setValue(3)
+        self.video_clip_count_spin.setSuffix(" 个")
+        self.video_clip_count_spin.setEnabled(False)
+        self.video_clip_count_spin.valueChanged.connect(self.auto_save_config)
+        
+        video_clip_control_layout.addWidget(self.enable_video_clips_checkbox)
+        video_clip_control_layout.addWidget(clip_count_label)
+        video_clip_control_layout.addWidget(self.video_clip_count_spin)
+        video_clip_control_layout.addStretch()
+        layout.addLayout(video_clip_control_layout)
+        
+        # 视频片段缩放模式设置
+        scale_mode_layout = QHBoxLayout()
+        scale_mode_label = QLabel("缩放模式:")
+        self.video_clip_scale_combo = QComboBox()
+        self.video_clip_scale_combo.addItems(["裁剪模式 (保持比例)", "适应模式 (添加黑边)", "拉伸模式 (可能变形)"])
+        self.video_clip_scale_combo.setCurrentText("裁剪模式 (保持比例)")
+        self.video_clip_scale_combo.currentTextChanged.connect(self.on_scale_mode_changed)
+        
+        scale_mode_layout.addWidget(scale_mode_label)
+        scale_mode_layout.addWidget(self.video_clip_scale_combo)
+        scale_mode_layout.addStretch()
+        layout.addLayout(scale_mode_layout)
         
         return group
     
@@ -1002,6 +1468,71 @@ class MainWindow(QMainWindow):
         # 保存配置
         self.config_manager.update_config(processing_mode=mode)
     
+    def select_video_clip_folder(self):
+        """选择视频片段文件夹"""
+        folder_path = QFileDialog.getExistingDirectory(
+            self, 
+            "选择视频片段文件夹"
+        )
+        
+        if folder_path:
+            self.selected_video_clip_folder = folder_path
+            self.video_clip_folder_label.setText(f"已选择: {os.path.basename(folder_path)}")
+            self.video_clip_folder_label.setStyleSheet("color: #333; font-style: normal;")
+            
+            # 自动保存配置
+            self.config_manager.update_config(video_clip_folder=folder_path)
+    
+    def toggle_video_clips(self):
+        """切换视频片段插入功能"""
+        self.enable_video_clips = self.enable_video_clips_checkbox.isChecked()
+        self.video_clip_count_spin.setEnabled(self.enable_video_clips)
+        
+        # 更新按钮样式
+        if self.enable_video_clips:
+            self.enable_video_clips_checkbox.setStyleSheet("""
+                QPushButton {
+                    background-color: #28a745;
+                    color: white;
+                    border: none;
+                    padding: 8px 16px;
+                    border-radius: 4px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #218838;
+                }
+            """)
+        else:
+            self.enable_video_clips_checkbox.setStyleSheet("""
+                QPushButton {
+                    background-color: #6c757d;
+                    color: white;
+                    border: none;
+                    padding: 8px 16px;
+                    border-radius: 4px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #5a6268;
+                }
+            """)
+        
+        # 保存配置
+        self.config_manager.update_config(enable_video_clips=self.enable_video_clips)
+    
+    def on_scale_mode_changed(self, mode_text: str):
+        """处理缩放模式变化"""
+        if "裁剪模式" in mode_text:
+            self.video_clip_scale_mode = "crop"
+        elif "适应模式" in mode_text:
+            self.video_clip_scale_mode = "fit"
+        elif "拉伸模式" in mode_text:
+            self.video_clip_scale_mode = "stretch"
+        
+        # 保存配置
+        self.config_manager.update_config(video_clip_scale_mode=self.video_clip_scale_mode)
+    
     def select_processed_folder(self):
         """选择已处理图片文件夹"""
         folder_path = QFileDialog.getExistingDirectory(
@@ -1052,7 +1583,11 @@ class MainWindow(QMainWindow):
             self.selected_audio_folder = None
             self.selected_processed_folder = None
             self.selected_output_folder = None
+            self.selected_video_clip_folder = None
             self.processing_mode = "single"
+            self.enable_video_clips = False
+            self.video_clip_count = 3
+            self.video_clip_scale_mode = "crop"
             
             self.image_folder_label.setText("未选择文件夹")
             self.image_folder_label.setStyleSheet("color: #999; font-style: italic;")
@@ -1064,10 +1599,18 @@ class MainWindow(QMainWindow):
             self.processed_folder_label.setStyleSheet("color: #999; font-style: italic;")
             self.output_folder_label.setText("未选择输出文件夹")
             self.output_folder_label.setStyleSheet("color: #999; font-style: italic;")
+            self.video_clip_folder_label.setText("未选择视频片段文件夹")
+            self.video_clip_folder_label.setStyleSheet("color: #999; font-style: italic;")
             
             # 重置处理模式按钮
             self.single_mode_btn.setChecked(True)
             self.batch_mode_btn.setChecked(False)
+            
+            # 重置视频片段设置
+            self.enable_video_clips_checkbox.setChecked(False)
+            self.video_clip_count_spin.setEnabled(False)
+            self.video_clip_count_spin.setValue(3)
+            self.video_clip_scale_combo.setCurrentText("裁剪模式 (保持比例)")
             
             # 重新加载配置到UI
             self.load_config_to_ui()
@@ -1270,7 +1813,11 @@ class MainWindow(QMainWindow):
             self.preset_combo.currentText(),
             int(self.crf_spin.value()),
             int(self.threads_spin.value()),
-            self.selected_processed_folder
+            self.selected_processed_folder,
+            self.selected_video_clip_folder,
+            self.enable_video_clips,
+            int(self.video_clip_count_spin.value()),
+            self.video_clip_scale_mode
         )
         
         # 连接信号

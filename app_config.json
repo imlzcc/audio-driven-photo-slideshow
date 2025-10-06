@@ -1,9 +1,9 @@
 {
   "image_folder": "E:/app/ComfyUI-V51/ComfyUI/output",
-  "audio_file": "E:/YTB_N8N_WORKSPACE/processed_audio/555test_story_title.mp3",
+  "audio_file": "E:/YTB_N8N_WORKSPACE/processed_audio/222test_story_title.mp3",
   "output_folder": "C:/Users/facd/Downloads",
   "image_duration_min": 4.0,
-  "image_duration_max": 23.0,
+  "image_duration_max": 7.0,
   "animation_effect": "随机效果",
   "animation_intensity": 1.0,
   "resolution": "1920x1080 (16:9)",
@@ -15,5 +15,9 @@
   "threads": 1.0,
   "audio_folder": "E:/YTB_N8N_WORKSPACE/processed_audio",
   "processed_folder": "E:/YTB_N8N_WORKSPACE/Images",
-  "processing_mode": "single"
+  "video_clip_folder": "E:/素材仓库/视频素材/旅行风景",
+  "processing_mode": "single",
+  "enable_video_clips": true,
+  "video_clip_count": 3,
+  "video_clip_scale_mode": "fit"
 }
