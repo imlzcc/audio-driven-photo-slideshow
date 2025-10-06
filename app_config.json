@@ -1,0 +1,19 @@
+{
+  "image_folder": "E:/app/ComfyUI-V51/ComfyUI/output",
+  "audio_file": "E:/YTB_N8N_WORKSPACE/processed_audio/555test_story_title.mp3",
+  "output_folder": "C:/Users/facd/Downloads",
+  "image_duration_min": 4.0,
+  "image_duration_max": 23.0,
+  "animation_effect": "随机效果",
+  "animation_intensity": 1.0,
+  "resolution": "1920x1080 (16:9)",
+  "custom_width": 1920.0,
+  "custom_height": 1080.0,
+  "fps": 24.0,
+  "preset": "ultrafast",
+  "crf": 23.0,
+  "threads": 1.0,
+  "audio_folder": "E:/YTB_N8N_WORKSPACE/processed_audio",
+  "processed_folder": "E:/YTB_N8N_WORKSPACE/Images",
+  "processing_mode": "single"
+}
