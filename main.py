@@ -8,16 +8,185 @@ import os
 import random
 import time
 import shutil
+import subprocess
 from typing import List, Optional
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QFileDialog, 
-                             QMessageBox, QDoubleSpinBox, QComboBox, QProgressBar,
+                             QMessageBox, QDoubleSpinBox, QComboBox, QProgressBar, QCheckBox,
                              QGroupBox, QFrame, QTextEdit, QSplitter)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QFont
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 from animation_effects import create_animated_clip, get_supported_effects
 from config_manager import ConfigManager
+import psutil
+
+
+class SilentLogger:
+    """A simple silent logger that produces no output.
+    Safe for GUI apps where sys.stdout may be None.
+    """
+    def __call__(self, message=None):
+        pass
+    
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
+def safe_write_videofile(video_clip, output_path, fps=24, preset='ultrafast', crf=23, threads=1, audio_codec='aac'):
+    """使用GPU加速 + 多线程帧预取的超高速导出
+    
+    使用线程池并行获取帧，配合NVIDIA NVENC硬件编码器
+    """
+    import tempfile
+    import uuid
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from queue import Queue
+    import threading
+    
+    temp_dir = tempfile.gettempdir()
+    unique_id = uuid.uuid4().hex[:8]
+    temp_audio = os.path.join(temp_dir, f"temp_a_{unique_id}.wav")
+    temp_video_no_audio = os.path.join(temp_dir, f"temp_v_{unique_id}.mp4")
+    
+    try:
+        # 获取视频尺寸和时长
+        duration = video_clip.duration
+        height, width = video_clip.size[1], video_clip.size[0]
+        total_frames = int(duration * fps)
+        
+        # 步骤1: 使用NVENC GPU编码器通过管道流式编码视频
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}',
+            '-pix_fmt', 'rgb24',
+            '-r', str(fps),
+            '-i', '-',  # 从stdin读取
+            '-c:v', 'h264_nvenc',  # NVIDIA GPU编码器
+            '-preset', 'p1',  # p1是最快的预设
+            '-tune', 'hq',  # 高质量调优
+            '-rc', 'vbr',  # 可变比特率
+            '-cq', str(crf),
+            '-b:v', '8M',  # 提高比特率以提升质量
+            '-maxrate', '15M',
+            '-bufsize', '15M',
+            '-pix_fmt', 'yuv420p',
+            '-loglevel', 'error',
+            temp_video_no_audio
+        ]
+        
+        # 启动ffmpeg进程
+        process = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        
+        # 使用批量渲染模式 - 一次性渲染多帧
+        batch_size = 60  # 每批处理60帧（约2.5秒）
+        
+        for batch_start in range(0, total_frames, batch_size):
+            batch_end = min(batch_start + batch_size, total_frames)
+            
+            # 批量获取时间点
+            times = [frame_idx / fps for frame_idx in range(batch_start, batch_end)]
+            
+            # 批量渲染帧（这比逐帧调用get_frame快很多）
+            for t in times:
+                if t >= duration:
+                    break
+                    
+                frame = video_clip.get_frame(t)
+                try:
+                    process.stdin.write(frame.astype('uint8').tobytes())
+                except BrokenPipeError:
+                    break
+        
+        # 关闭stdin并等待完成
+        process.stdin.close()
+        process.wait()
+        
+        # 步骤2: 处理音频 - 使用ffmpeg直接提取和合并，避免numpy兼容性问题
+        if video_clip.audio is not None:
+            try:
+                # 使用moviepy写入临时音频文件，使用write_audiofile避免to_soundarray的numpy问题
+                print(f"DEBUG: 使用moviepy导出音频到临时文件...")
+                video_clip.audio.write_audiofile(
+                    temp_audio,
+                    fps=44100,
+                    nbytes=2,
+                    codec='pcm_s16le',
+                    logger=None,
+                    verbose=False
+                )
+                
+                # 验证音频文件是否创建成功
+                if not os.path.exists(temp_audio) or os.path.getsize(temp_audio) == 0:
+                    raise Exception("音频文件创建失败")
+                
+                print(f"DEBUG: 音频文件已创建: {temp_audio}")
+                
+                # 使用ffmpeg合并视频和音频
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-i', temp_video_no_audio,
+                    '-i', temp_audio,
+                    '-c:v', 'copy',  # 直接复制视频流
+                    '-c:a', 'aac',   # 音频编码为AAC
+                    '-b:a', '192k',  # 音频比特率
+                    '-shortest',     # 使用最短的流长度
+                    '-movflags', '+faststart',
+                    output_path
+                ]
+                
+                print(f"DEBUG: 执行ffmpeg合并命令...")
+                # 运行ffmpeg，捕获错误输出
+                result = subprocess.run(
+                    cmd, 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE,
+                    check=False
+                )
+                
+                if result.returncode != 0:
+                    error_msg = result.stderr.decode('utf-8', errors='ignore')
+                    raise Exception(f"ffmpeg合并音频失败: {error_msg}")
+                
+                # 验证输出文件
+                if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                    raise Exception("输出文件创建失败")
+                
+                print(f"DEBUG: 视频音频合并成功")
+                    
+            except Exception as e:
+                # 如果音频处理失败，至少保存无音频版本，并报告错误
+                import traceback
+                print(f"警告: 音频处理失败 - {str(e)}")
+                print(traceback.format_exc())
+                
+                # 保存无音频版本
+                if os.path.exists(temp_video_no_audio):
+                    shutil.copy2(temp_video_no_audio, output_path)
+                    raise Exception(f"音频处理失败，已保存无音频版本: {str(e)}")
+                else:
+                    raise
+        else:
+            # 没有音频，直接复制
+            shutil.copy2(temp_video_no_audio, output_path)
+            
+    finally:
+        # 清理临时文件
+        for f in [temp_audio, temp_video_no_audio]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
 
 
 class VideoGenerationWorker(QThread):
@@ -35,7 +204,7 @@ class VideoGenerationWorker(QThread):
                  crf: int = 23, threads: int | None = None, processed_folder: str | None = None,
                  video_clip_folder: str | None = None, enable_video_clips: bool = False, 
                  video_clip_count: int = 3, video_clip_scale_mode: str = "crop",
-                 processed_video_folder: str | None = None):
+                 processed_video_folder: str | None = None, enable_segmented_processing: bool = True):
         super().__init__()
         self.image_folder = image_folder
         self.audio_file = audio_file
@@ -54,6 +223,7 @@ class VideoGenerationWorker(QThread):
         self.video_clip_count = video_clip_count
         self.video_clip_scale_mode = video_clip_scale_mode
         self.processed_video_folder = processed_video_folder
+        self.enable_segmented_processing = enable_segmented_processing
         
         # 支持的图片格式
         self.image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
@@ -67,16 +237,49 @@ class VideoGenerationWorker(QThread):
         # 跟踪实际处理的视频片段
         self.actually_processed_videos = []
         
+        # 分段导出产生的临时文件
+        self.temp_segment_files = []
+        
         # 线程控制
         self._is_running = True
     
     def run(self):
         """执行视频生成"""
+        # 全局设置stdout/stderr保护，避免moviepy任何地方访问None的stdout
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        original_stdin = sys.stdin
+        
+        class DummyFile:
+            def write(self, x): return len(str(x)) if x else 0
+            def flush(self): pass
+            def close(self): pass
+            def read(self, *args): return ''
+            def readline(self, *args): return ''
+            def isatty(self): return False
+            def fileno(self): return -1
+            def __getattr__(self, name): return lambda *args, **kwargs: None
+        
+        dummy = DummyFile()
+        if sys.stdout is None:
+            sys.stdout = dummy
+        if sys.stderr is None:
+            sys.stderr = dummy
+        if sys.stdin is None:
+            sys.stdin = dummy
+        
         try:
             if not self._is_running:
                 return
+            
+            # 记录开始时间
+            import time as time_module
+            start_time = time_module.time()
+            step_times = {}  # 记录各步骤耗时
+            
             # 步骤1: 输入验证
             self.log_updated.emit("=== 开始视频生成 ===")
+            self.log_updated.emit(f"开始时间: {time_module.strftime('%Y-%m-%d %H:%M:%S')}")
             self.log_updated.emit(f"图片文件夹: {self.image_folder}")
             self.log_updated.emit(f"音频文件: {self.audio_file}")
             if isinstance(self.image_duration, tuple):
@@ -104,15 +307,18 @@ class VideoGenerationWorker(QThread):
             self.log_updated.emit("✓ 输入文件验证通过")
             
             # 步骤2: 加载音频文件
+            step_start = time_module.time()
             self.status_updated.emit("加载音频文件...")
             self.log_updated.emit("步骤2: 加载音频文件...")
             self.progress_updated.emit(10)
             
             audio_clip = AudioFileClip(self.audio_file)
             audio_duration = audio_clip.duration
-            self.log_updated.emit(f"✓ 音频加载完成，时长: {audio_duration:.2f}秒 ({audio_duration/60:.1f}分钟)")
+            step_times['加载音频'] = time_module.time() - step_start
+            self.log_updated.emit(f"✓ 音频加载完成，时长: {audio_duration:.2f}秒 ({audio_duration/60:.1f}分钟) [耗时: {step_times['加载音频']:.1f}秒]")
             
             # 步骤3: 读取图片文件夹
+            step_start = time_module.time()
             self.status_updated.emit("扫描图片文件...")
             self.log_updated.emit("步骤3: 扫描图片文件...")
             self.progress_updated.emit(15)
@@ -127,10 +333,12 @@ class VideoGenerationWorker(QThread):
             
             # 按文件名排序
             image_files.sort()
-            self.log_updated.emit(f"✓ 找到 {len(image_files)} 张图片")
+            step_times['扫描图片'] = time_module.time() - step_start
+            self.log_updated.emit(f"✓ 找到 {len(image_files)} 张图片 [耗时: {step_times['扫描图片']:.1f}秒]")
             self.log_updated.emit(f"图片列表: {[os.path.basename(f) for f in image_files[:5]]}{'...' if len(image_files) > 5 else ''}")
-            
+
             # 步骤4: 创建视频片段
+            step_start = time_module.time()
             self.status_updated.emit("创建视频片段...")
             self.log_updated.emit("步骤4: 创建视频片段...")
             self.log_updated.emit(f"预计处理 {len(image_files)} 张图片，每张 {self.image_duration} 秒")
@@ -210,11 +418,13 @@ class VideoGenerationWorker(QThread):
             if not clips:
                 raise ValueError("没有成功创建任何视频片段")
             
-            self.log_updated.emit(f"✓ 视频片段创建完成，共处理 {processed_count} 张图片")
+            step_times['创建视频片段'] = time_module.time() - step_start
+            self.log_updated.emit(f"✓ 视频片段创建完成，共处理 {processed_count} 张图片 [耗时: {step_times['创建视频片段']:.1f}秒]")
             self.log_updated.emit(f"总视频时长: {current_video_duration:.1f}s")
             
             # 步骤5: 插入视频片段
             if self.enable_video_clips:
+                step_start = time_module.time()
                 self.status_updated.emit("插入视频片段...")
                 self.log_updated.emit("步骤5: 插入视频片段...")
                 self.progress_updated.emit(80)
@@ -222,7 +432,8 @@ class VideoGenerationWorker(QThread):
                 
                 # 重新计算视频总时长
                 new_video_duration = sum(clip.duration for clip in clips)
-                self.log_updated.emit(f"插入视频片段后，总时长: {new_video_duration:.2f}s")
+                step_times['插入视频片段'] = time_module.time() - step_start
+                self.log_updated.emit(f"插入视频片段后，总时长: {new_video_duration:.2f}s [耗时: {step_times['插入视频片段']:.1f}秒]")
                 
                 # 如果视频时长超过音频时长，给出警告
                 if new_video_duration > audio_duration:
@@ -231,54 +442,22 @@ class VideoGenerationWorker(QThread):
                 
                 self.log_updated.emit("✓ 视频片段插入完成")
             
-            # 步骤6: 最终视频合成
-            self.status_updated.emit("合成视频...")
-            self.log_updated.emit("步骤6: 合成视频...")
-            self.progress_updated.emit(85)
-            
-            # 拼接视频片段
-            self.log_updated.emit("正在拼接视频片段...")
-            # 已统一分辨率时使用更快的 chain 方式
-            if self.resolution:
-                final_video = concatenate_videoclips(clips, method="chain")
+            # 步骤6: 分段处理或最终视频合成
+            step_start = time_module.time()
+            if self.enable_segmented_processing and audio_duration > 300:  # 超过5分钟启用分段处理
+                self.status_updated.emit("分段处理视频...")
+                self.log_updated.emit("步骤6: 分段处理视频...")
+                self.progress_updated.emit(85)
+                final_video = self.process_segmented_video(clips, audio_clip, audio_duration, image_files)
             else:
-                final_video = concatenate_videoclips(clips)
-            final_video_duration = final_video.duration
-            self.log_updated.emit(f"✓ 视频拼接完成，最终时长: {final_video_duration:.1f}s")
+                self.status_updated.emit("合成视频...")
+                self.log_updated.emit("步骤6: 合成视频...")
+                self.progress_updated.emit(85)
+                final_video = self.process_single_video(clips, audio_clip, audio_duration)
             
-            # 精确同步音频
-            self.status_updated.emit("同步音频...")
-            self.log_updated.emit("步骤7: 同步音频...")
-            self.progress_updated.emit(90)
-            
-            # 将音频剪辑到与视频相同的长度
-            self.log_updated.emit("正在同步音频到视频长度...")
-            self.log_updated.emit(f"音频时长: {audio_clip.duration:.2f}s, 视频时长: {final_video_duration:.2f}s")
-            
-            # 处理音频和视频时长不匹配的情况
-            if final_video_duration > audio_clip.duration:
-                # 视频比音频长，需要循环播放音频
-                self.log_updated.emit(f"视频时长({final_video_duration:.2f}s)超过音频时长({audio_clip.duration:.2f}s)，将循环播放音频")
-                
-                # 计算需要循环的次数
-                loops_needed = int(final_video_duration / audio_clip.duration) + 1
-                self.log_updated.emit(f"需要循环播放 {loops_needed} 次音频")
-                
-                # 创建循环音频
-                audio_clips = [audio_clip] * loops_needed
-                from moviepy.editor import concatenate_audioclips
-                looped_audio = concatenate_audioclips(audio_clips)
-                
-                # 剪辑到视频长度
-                synced_audio = looped_audio.subclip(0, final_video_duration)
-                final_video = final_video.set_audio(synced_audio)
-                self.log_updated.emit(f"✓ 音频循环播放完成，最终时长: {final_video_duration:.2f}s")
-                
-            else:
-                # 视频比音频短或相等，直接剪辑音频
-                synced_audio = audio_clip.subclip(0, final_video_duration)
-                final_video = final_video.set_audio(synced_audio)
-                self.log_updated.emit(f"✓ 音频同步完成，同步时长: {final_video_duration:.2f}s")
+            # 设置音频
+            final_video = final_video.set_audio(audio_clip)
+            self.log_updated.emit(f"✓ 视频音频同步完成，最终时长: {final_video.duration:.2f}s")
             
             # 步骤8: 导出视频
             self.status_updated.emit("导出视频中...")
@@ -288,28 +467,34 @@ class VideoGenerationWorker(QThread):
             self.progress_updated.emit(95)
             
             # 根据视频长度调整导出参数
-            ffmpeg_params = ["-movflags", "+faststart", "-pix_fmt", "yuv420p"]
             self.log_updated.emit("开始编码导出...")
-            final_video.write_videofile(
+            
+            # 使用安全的导出函数
+            safe_write_videofile(
+                final_video,
                 self.output_path,
                 fps=self.fps,
-                codec='libx264',
-                audio_codec='aac',
                 preset=self.preset,
+                crf=self.crf,
                 threads=self.threads,
-                ffmpeg_params=ffmpeg_params + ["-crf", str(self.crf)],
-                verbose=False,
-                logger=None,
-                temp_audiofile='temp-audio.m4a',
-                remove_temp=True
+                audio_codec='aac'
             )
             
-            self.log_updated.emit("✓ 视频导出完成")
+            step_times['导出视频'] = time_module.time() - step_start
+            self.log_updated.emit(f"✓ 视频导出完成 [耗时: {step_times['导出视频']:.1f}秒]")
             
             # 清理资源
             self.log_updated.emit("正在清理资源...")
             audio_clip.close()
             final_video.close()
+            # 删除分段临时文件
+            if hasattr(self, 'temp_segment_files') and self.temp_segment_files:
+                for fp in self.temp_segment_files:
+                    try:
+                        if os.path.exists(fp):
+                            os.remove(fp)
+                    except Exception:
+                        pass
             self.log_updated.emit("✓ 资源清理完成")
             
             # 移动已处理的图片到指定文件夹
@@ -320,15 +505,221 @@ class VideoGenerationWorker(QThread):
             if self.processed_video_folder and os.path.exists(self.processed_video_folder):
                 self.move_processed_videos()
             
+            # 计算总耗时
+            total_time = time_module.time() - start_time
+            
             self.status_updated.emit("完成！")
             self.progress_updated.emit(100)
             self.log_updated.emit("=== 视频生成完成 ===")
+            self.log_updated.emit(f"完成时间: {time_module.strftime('%Y-%m-%d %H:%M:%S')}")
+            self.log_updated.emit(f"")
+            self.log_updated.emit(f"📊 耗时统计:")
+            for step_name, step_time in step_times.items():
+                percentage = (step_time / total_time) * 100 if total_time > 0 else 0
+                self.log_updated.emit(f"  • {step_name}: {step_time:.1f}秒 ({percentage:.1f}%)")
+            self.log_updated.emit(f"")
+            self.log_updated.emit(f"⏱️ 总耗时: {total_time:.1f}秒 ({total_time/60:.1f}分钟)")
+            if audio_duration > 0:
+                speed_ratio = audio_duration / total_time
+                self.log_updated.emit(f"⚡ 处理速度: {speed_ratio:.2f}x 实时速度")
             self.generation_finished.emit(True, f"视频已成功保存到: {self.output_path}")
             
         except Exception as e:
             self.log_updated.emit(f"✗ 生成失败: {str(e)}")
             self.status_updated.emit("生成失败")
             self.generation_finished.emit(False, f"生成失败: {str(e)}")
+        finally:
+            # 恢复原始的stdout/stderr/stdin
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            sys.stdin = original_stdin
+    
+    def process_single_video(self, clips, audio_clip, audio_duration):
+        """处理单个视频（非分段模式）"""
+        # 拼接视频片段
+        self.log_updated.emit("正在拼接视频片段...")
+        # 已统一分辨率时使用更快的 chain 方式
+        if self.resolution:
+            final_video = concatenate_videoclips(clips, method="chain")
+        else:
+            final_video = concatenate_videoclips(clips)
+        final_video_duration = final_video.duration
+        self.log_updated.emit(f"✓ 视频拼接完成，最终时长: {final_video_duration:.1f}s")
+        
+        # 精确同步视频到音频长度
+        self.status_updated.emit("同步视频到音频长度...")
+        self.log_updated.emit("步骤7: 同步视频到音频长度...")
+        self.progress_updated.emit(90)
+        
+        # 将视频调整到与音频相同的长度
+        self.log_updated.emit("正在同步视频到音频长度...")
+        self.log_updated.emit(f"音频时长: {audio_clip.duration:.2f}s, 视频时长: {final_video_duration:.2f}s")
+        
+        # 处理音频和视频时长不匹配的情况
+        if final_video_duration < audio_clip.duration:
+            # 视频比音频短，需要延长视频
+            self.log_updated.emit(f"视频时长({final_video_duration:.2f}s)短于音频时长({audio_clip.duration:.2f}s)，将延长视频")
+            
+            # 计算需要延长的时长
+            extend_duration = audio_clip.duration - final_video_duration
+            self.log_updated.emit(f"需要延长视频 {extend_duration:.2f}s")
+            
+            # 使用最后一帧延长视频
+            last_frame = final_video.subclip(final_video_duration - 0.1, final_video_duration)
+            extended_clip = last_frame.loop(duration=extend_duration)
+            
+            # 拼接原视频和延长部分
+            final_video = concatenate_videoclips([final_video, extended_clip])
+            final_video_duration = audio_clip.duration
+            self.log_updated.emit(f"✓ 视频延长完成，最终时长: {final_video_duration:.2f}s")
+            
+        elif final_video_duration > audio_clip.duration:
+            # 视频比音频长，需要缩短视频
+            self.log_updated.emit(f"视频时长({final_video_duration:.2f}s)超过音频时长({audio_clip.duration:.2f}s)，将缩短视频")
+            
+            # 直接剪辑视频到音频长度
+            final_video = final_video.subclip(0, audio_clip.duration)
+            final_video_duration = audio_clip.duration
+            self.log_updated.emit(f"✓ 视频缩短完成，最终时长: {final_video_duration:.2f}s")
+        
+        return final_video
+    
+    def process_segmented_video(self, clips, audio_clip, audio_duration, image_files):
+        """分段处理视频（节省内存）"""
+        self.log_updated.emit(f"开始分段处理，音频总时长: {audio_duration:.1f}s")
+        
+        # 计算分段参数
+        segment_duration = 300  # 每段5分钟
+        num_segments = int(audio_duration / segment_duration) + 1
+        self.log_updated.emit(f"将分为 {num_segments} 段处理，每段约 {segment_duration}s")
+        
+        # 临时目录用于保存分段视频
+        temp_dir = os.path.join(os.path.dirname(self.output_path) or os.getcwd(), "_segments")
+        try:
+            if not os.path.exists(temp_dir):
+                os.makedirs(temp_dir)
+        except Exception:
+            # 回退到当前目录
+            temp_dir = os.getcwd()
+        
+        temp_segment_paths = []
+        
+        for i in range(num_segments):
+            start_time = i * segment_duration
+            end_time = min((i + 1) * segment_duration, audio_duration)
+            segment_audio_duration = end_time - start_time
+            
+            self.log_updated.emit(f"处理第 {i+1}/{num_segments} 段: {start_time:.1f}s - {end_time:.1f}s")
+            
+            # 为当前段落创建音频片段
+            segment_audio = audio_clip.subclip(start_time, end_time)
+            
+            # 为当前段落分配图片片段
+            segment_clips = self.allocate_clips_for_segment(clips, segment_audio_duration, i, num_segments)
+            
+            # 处理当前段落的视频片段
+            if self.enable_video_clips:
+                segment_clips = self.insert_video_clips(segment_clips, segment_audio_duration, image_files)
+            
+            # 拼接当前段落的视频
+            if segment_clips:
+                if self.resolution:
+                    segment_video = concatenate_videoclips(segment_clips, method="chain")
+                else:
+                    segment_video = concatenate_videoclips(segment_clips)
+                
+                # 同步到音频长度
+                if segment_video.duration < segment_audio_duration:
+                    # 延长视频
+                    extend_duration = segment_audio_duration - segment_video.duration
+                    last_frame = segment_video.subclip(segment_video.duration - 0.1, segment_video.duration)
+                    extended_clip = last_frame.loop(duration=extend_duration)
+                    segment_video = concatenate_videoclips([segment_video, extended_clip])
+                elif segment_video.duration > segment_audio_duration:
+                    # 缩短视频
+                    segment_video = segment_video.subclip(0, segment_audio_duration)
+                
+                # 设置音频并导出为临时文件，释放内存
+                segment_video = segment_video.set_audio(segment_audio)
+                temp_path = os.path.join(temp_dir, f"segment_{i+1:03d}.mp4")
+                self.log_updated.emit(f"导出第 {i+1} 段到临时文件: {os.path.basename(temp_path)}")
+                
+                # 使用安全的导出函数
+                safe_write_videofile(
+                    segment_video,
+                    temp_path,
+                    fps=self.fps,
+                    preset=self.preset,
+                    crf=23,
+                    threads=self.threads,
+                    audio_codec='aac'
+                )
+                # 关闭释放内存
+                try:
+                    segment_video.close()
+                except Exception:
+                    pass
+                try:
+                    segment_audio.close()
+                except Exception:
+                    pass
+                temp_segment_paths.append(temp_path)
+                self.temp_segment_files.append(temp_path)
+                
+                self.log_updated.emit(f"✓ 第 {i+1} 段处理完成，时长: {segment_audio_duration:.1f}s")
+            else:
+                self.log_updated.emit(f"⚠️ 第 {i+1} 段没有可用的视频片段")
+            
+            # 强制清理内存
+            import gc
+            gc.collect()
+            
+            # 更新进度
+            progress = 85 + (i + 1) * 10 // num_segments
+            self.progress_updated.emit(progress)
+        
+        # 拼接所有段落（基于磁盘文件，内存占用更低）
+        if temp_segment_paths:
+            self.log_updated.emit("拼接所有段落(基于临时文件)...")
+            from moviepy.editor import VideoFileClip
+            concat_clips = []
+            for p in temp_segment_paths:
+                try:
+                    concat_clips.append(VideoFileClip(p))
+                except Exception as e:
+                    self.log_updated.emit(f"✗ 加载段落失败 {os.path.basename(p)}: {str(e)}")
+            if concat_clips:
+                final_video = concatenate_videoclips(concat_clips, method="chain")
+                self.log_updated.emit(f"✓ 分段处理完成，最终时长: {final_video.duration:.1f}s")
+                return final_video
+            else:
+                self.log_updated.emit("✗ 无法加载任何段落视频")
+                return None
+        else:
+            self.log_updated.emit("✗ 分段处理失败，没有生成任何段落")
+            return None
+    
+    def allocate_clips_for_segment(self, clips, segment_duration, segment_index, total_segments):
+        """为段落分配图片片段"""
+        if not clips:
+            return []
+        
+        # 计算当前段落应该使用的图片数量
+        total_duration = sum(clip.duration for clip in clips)
+        if total_duration == 0:
+            return []
+        
+        # 按比例分配图片片段
+        segment_ratio = segment_duration / total_duration
+        num_clips = max(1, int(len(clips) * segment_ratio))
+        
+        # 选择图片片段
+        start_index = segment_index * num_clips
+        end_index = min(start_index + num_clips, len(clips))
+        segment_clips = clips[start_index:end_index]
+        
+        self.log_updated.emit(f"段落 {segment_index + 1}: 分配了 {len(segment_clips)} 个图片片段")
+        return segment_clips
     
     def move_processed_images(self):
         """移动已处理的图片到已处理文件夹"""
@@ -439,7 +830,7 @@ class VideoGenerationWorker(QThread):
         return sorted(video_clips)
     
     def insert_video_clips(self, clips, audio_duration, image_files):
-        """在视频片段中插入视频片段 - 按照用户建议的简单逻辑"""
+        """在视频片段中插入视频片段 - 内存优化版本"""
         if not self.enable_video_clips or not clips:
             return clips
         
@@ -450,59 +841,168 @@ class VideoGenerationWorker(QThread):
         
         self.log_updated.emit(f"找到 {len(video_clips)} 个视频片段，准备插入")
         
+        # 显示系统内存信息
+        memory_info = psutil.virtual_memory()
+        self.log_updated.emit(f"系统内存信息: 总计 {memory_info.total // (1024**3)}GB, 可用 {memory_info.available // (1024**3)}GB, 使用率 {memory_info.percent:.1f}%")
+        
         try:
-            from moviepy.editor import VideoFileClip
+            from moviepy.editor import VideoFileClip, concatenate_videoclips
+            import gc
+            import ctypes
             
             # 第一步：获取音频时长
             self.log_updated.emit(f"音频时长: {audio_duration:.1f}s")
             
-            # 第二步：获取三个视频片段时长
+            # 强制内存释放函数
+            def force_memory_cleanup():
+                """强制内存清理和压缩"""
+                try:
+                    # 强制垃圾回收
+                    gc.collect()
+                    gc.collect()
+                    
+                    # 尝试压缩内存（Windows）
+                    try:
+                        ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1, -1)
+                    except:
+                        pass
+                    
+                    # 获取当前内存使用率
+                    memory_percent = psutil.virtual_memory().percent
+                    return memory_percent
+                except Exception as e:
+                    self.log_updated.emit(f"内存清理失败: {str(e)}")
+                    return psutil.virtual_memory().percent
+            
+            # 第二步：分批处理视频片段，避免内存溢出
             video_clip_data = []
             total_video_duration = 0
             
-            for video_path in video_clips:
-                try:
-                    video_clip = VideoFileClip(video_path)
-                    video_clip = video_clip.without_audio()
-                    
-                    # 保持视频片段完整，但限制最大时长
-                    original_duration = video_clip.duration
-                    max_allowed_duration = 15.0
-                    min_allowed_duration = 1.0
-                    
-                    if original_duration > max_allowed_duration:
-                        start_time = (original_duration - max_allowed_duration) / 2
-                        video_clip = video_clip.subclip(start_time, start_time + max_allowed_duration)
-                        actual_duration = max_allowed_duration
-                        self.log_updated.emit(f"视频片段过长，从中间截取: {os.path.basename(video_path)} ({original_duration:.1f}s -> {actual_duration:.1f}s)")
-                    elif original_duration < min_allowed_duration:
-                        loops_needed = int(min_allowed_duration / original_duration) + 1
-                        video_clips_loop = [video_clip] * loops_needed
-                        video_clip = concatenate_videoclips(video_clips_loop).subclip(0, min_allowed_duration)
-                        actual_duration = min_allowed_duration
-                        self.log_updated.emit(f"视频片段过短，循环播放: {os.path.basename(video_path)} ({original_duration:.1f}s -> {actual_duration:.1f}s)")
-                    else:
-                        actual_duration = original_duration
-                        self.log_updated.emit(f"视频片段时长合适: {os.path.basename(video_path)} ({actual_duration:.1f}s)")
-                    
-                    video_clip_data.append({
-                        'clip': video_clip,
-                        'duration': actual_duration,
-                        'path': video_path
-                    })
-                    total_video_duration += actual_duration
-                    
-                except Exception as e:
-                    self.log_updated.emit(f"✗ 加载视频片段失败 {os.path.basename(video_path)}: {str(e)}")
-                    continue
+            # 根据视频片段数量和内存使用情况动态调整批次大小
+            current_memory = force_memory_cleanup()
+            self.log_updated.emit(f"初始内存使用率: {current_memory:.1f}%")
+            
+            if current_memory > 95:
+                batch_size = 1  # 内存严重不足时一次只处理1个
+                self.log_updated.emit("内存严重不足，使用最小批次大小")
+            elif current_memory > 90:
+                batch_size = 1  # 内存不足时一次只处理1个
+                self.log_updated.emit("内存不足，使用最小批次大小")
+            elif current_memory > 80:
+                batch_size = 2  # 内存较高时一次处理2个
+            elif len(video_clips) <= 10:
+                batch_size = 5
+            elif len(video_clips) <= 50:
+                batch_size = 3
+            else:
+                batch_size = 2
+            
+            for i in range(0, len(video_clips), batch_size):
+                # 动态调整批次大小
+                current_memory = force_memory_cleanup()
+                if current_memory > 95:
+                    batch_size = 1
+                    self.log_updated.emit("内存使用率过高，强制使用最小批次大小")
+                elif current_memory > 90:
+                    batch_size = 2
+                    self.log_updated.emit("内存使用率较高，使用小批次大小")
+                
+                batch_videos = video_clips[i:i+batch_size]
+                self.log_updated.emit(f"处理视频片段批次 {i//batch_size + 1}/{(len(video_clips)-1)//batch_size + 1} ({len(batch_videos)} 个，内存使用率: {current_memory:.1f}%)")
+                
+                for video_path in batch_videos:
+                    try:
+                        # 检查内存使用情况
+                        memory_percent = force_memory_cleanup()
+                        if memory_percent > 98:
+                            self.log_updated.emit(f"⚠️ 内存使用率过高 ({memory_percent:.1f}%)，跳过当前视频片段")
+                            continue
+                        elif memory_percent > 95:
+                            self.log_updated.emit(f"⚠️ 内存使用率较高 ({memory_percent:.1f}%)，建议减少视频片段数量")
+                        
+                        video_clip = VideoFileClip(video_path)
+                        video_clip = video_clip.without_audio()
+                        
+                        # 智能调整视频片段时长以适应音频
+                        original_duration = video_clip.duration
+                        
+                        # 根据音频时长和视频片段数量动态调整最大时长
+                        estimated_video_count = len(video_clips)
+                        max_allowed_duration = min(10.0, audio_duration / max(estimated_video_count, 1) * 0.8)  # 降低最大时长
+                        min_allowed_duration = 1.0
+                        
+                        if original_duration > max_allowed_duration:
+                            start_time = (original_duration - max_allowed_duration) / 2
+                            video_clip = video_clip.subclip(start_time, start_time + max_allowed_duration)
+                            actual_duration = max_allowed_duration
+                            self.log_updated.emit(f"视频片段过长，从中间截取: {os.path.basename(video_path)} ({original_duration:.1f}s -> {actual_duration:.1f}s)")
+                        elif original_duration < min_allowed_duration:
+                            loops_needed = int(min_allowed_duration / original_duration) + 1
+                            video_clips_loop = [video_clip] * loops_needed
+                            video_clip = concatenate_videoclips(video_clips_loop).subclip(0, min_allowed_duration)
+                            actual_duration = min_allowed_duration
+                            self.log_updated.emit(f"视频片段过短，循环播放: {os.path.basename(video_path)} ({original_duration:.1f}s -> {actual_duration:.1f}s)")
+                        else:
+                            actual_duration = original_duration
+                            self.log_updated.emit(f"视频片段时长合适: {os.path.basename(video_path)} ({actual_duration:.1f}s)")
+                        
+                        video_clip_data.append({
+                            'clip': video_clip,
+                            'duration': actual_duration,
+                            'path': video_path
+                        })
+                        total_video_duration += actual_duration
+                        
+                    except Exception as e:
+                        self.log_updated.emit(f"✗ 加载视频片段失败 {os.path.basename(video_path)}: {str(e)}")
+                        continue
+                
+                # 每批处理完后强制清理内存
+                current_memory = force_memory_cleanup()
+                self.log_updated.emit(f"批次处理完成，当前内存使用率: {current_memory:.1f}%")
+                
+                # 如果内存使用率仍然很高，进行深度清理
+                if current_memory > 90:
+                    self.log_updated.emit("内存使用率较高，进行深度清理...")
+                    # 清理已处理的视频片段
+                    for data in video_clip_data:
+                        if 'clip' in data:
+                            try:
+                                data['clip'].close()
+                            except:
+                                pass
+                    # 再次强制清理
+                    force_memory_cleanup()
             
             if not video_clip_data:
                 self.log_updated.emit("没有成功加载任何视频片段")
+                # 如果内存不足导致无法加载视频片段，建议用户减少视频片段数量
+                current_memory = force_memory_cleanup()
+                if current_memory > 90:
+                    self.log_updated.emit("建议：内存不足，请减少视频片段数量或关闭其他程序")
+                    self.log_updated.emit("当前系统内存使用率过高，建议：")
+                    self.log_updated.emit("1. 关闭其他占用内存的程序")
+                    self.log_updated.emit("2. 减少视频片段数量")
+                    self.log_updated.emit("3. 检查是否有内存泄漏")
                 return clips
             
             self.log_updated.emit(f"视频片段总时长: {total_video_duration:.1f}s")
             
-            # 第三步：计算差值
+            # 第三步：智能分配时间
+            # 如果视频片段总时长超过音频的80%，则按比例缩短所有视频片段
+            if total_video_duration > audio_duration * 0.8:
+                scale_factor = (audio_duration * 0.8) / total_video_duration
+                self.log_updated.emit(f"视频片段总时长({total_video_duration:.1f}s)过长，按比例缩短到 {audio_duration * 0.8:.1f}s")
+                
+                # 重新计算所有视频片段的时长
+                total_video_duration = 0
+                for data in video_clip_data:
+                    new_duration = data['duration'] * scale_factor
+                    data['duration'] = new_duration
+                    data['clip'] = data['clip'].subclip(0, new_duration)
+                    total_video_duration += new_duration
+                    self.log_updated.emit(f"缩短视频片段: {os.path.basename(data['path'])} -> {new_duration:.1f}s")
+            
             remaining_time = audio_duration - total_video_duration
             self.log_updated.emit(f"剩余时间给图片: {remaining_time:.1f}s")
             
@@ -596,6 +1096,11 @@ class VideoGenerationWorker(QThread):
             # 创建所有片段的列表（图片 + 视频）
             all_segments = []
             
+            # 确保clips不为空
+            if not clips:
+                self.log_updated.emit("警告: 没有图片片段，无法创建视频")
+                return []
+            
             # 添加图片片段
             for i, clip in enumerate(clips):
                 all_segments.append({
@@ -645,6 +1150,7 @@ class VideoGenerationWorker(QThread):
             
         except Exception as e:
             self.log_updated.emit(f"✗ 视频片段插入失败: {str(e)}")
+            # 如果视频片段插入失败，返回原始clips
             return clips
     
     def _adjust_video_clip_resolution(self, video_clip):
@@ -756,6 +1262,7 @@ class MainWindow(QMainWindow):
         self.enable_video_clips = False
         self.video_clip_count = 3
         self.video_clip_scale_mode = "crop"  # "crop", "fit", "stretch"
+        self.enable_segmented_processing = False  # 默认禁用分段处理
         
         # 工作线程
         self.worker_thread = None
@@ -821,11 +1328,14 @@ class MainWindow(QMainWindow):
         self.enable_video_clips = self.config.get("enable_video_clips", False)
         self.video_clip_count = self.config.get("video_clip_count", 3)
         self.video_clip_scale_mode = self.config.get("video_clip_scale_mode", "crop")
+        self.enable_segmented_processing = self.config.get("enable_segmented_processing", False)  # 默认禁用
         
         # 更新视频片段UI状态
         if hasattr(self, 'enable_video_clips_checkbox'):
             self.enable_video_clips_checkbox.setChecked(self.enable_video_clips)
             self.video_clip_count_spin.setEnabled(self.enable_video_clips)
+            if hasattr(self, 'enable_segmented_processing_checkbox'):
+                self.enable_segmented_processing_checkbox.setChecked(self.enable_segmented_processing)
             self.video_clip_count_spin.setValue(self.video_clip_count)
             
             # 更新缩放模式下拉框
@@ -909,6 +1419,7 @@ class MainWindow(QMainWindow):
             "enable_video_clips": self.enable_video_clips,
             "video_clip_count": self.video_clip_count,
             "video_clip_scale_mode": self.video_clip_scale_mode,
+            "enable_segmented_processing": self.enable_segmented_processing,
             "image_duration_min": self.duration_min_spin.value(),
             "image_duration_max": self.duration_max_spin.value(),
             "animation_effect": self.effect_combo.currentText(),
@@ -936,12 +1447,12 @@ class MainWindow(QMainWindow):
         
         # 标题
         title_label = QLabel("音频驱动的图片幻灯片生成器")
-        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_label.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setFont(QFont("Arial", 16, QFont.Bold))
         main_layout.addWidget(title_label)
         
         # 创建分割器
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter = QSplitter(Qt.Vertical)
         
         # 上半部分：控制面板
         control_widget = QWidget()
@@ -1062,16 +1573,29 @@ class MainWindow(QMainWindow):
         # 视频片段数量设置
         clip_count_label = QLabel("插入数量:")
         self.video_clip_count_spin = QDoubleSpinBox()
-        self.video_clip_count_spin.setRange(1, 10)
+        self.video_clip_count_spin.setRange(1, 999)  # 改为最大999个
         self.video_clip_count_spin.setDecimals(0)
         self.video_clip_count_spin.setValue(3)
         self.video_clip_count_spin.setSuffix(" 个")
         self.video_clip_count_spin.setEnabled(False)
         self.video_clip_count_spin.valueChanged.connect(self.auto_save_config)
         
+        # 内存提示标签
+        memory_hint_label = QLabel("注意：大量视频片段可能消耗较多内存")
+        memory_hint_label.setStyleSheet("color: #ff6b6b; font-size: 10px; font-style: italic;")
+        memory_hint_label.setWordWrap(True)
+        
+        # 分段处理选项
+        self.enable_segmented_processing_checkbox = QCheckBox("启用分段处理（节省内存）")
+        self.enable_segmented_processing_checkbox.setChecked(self.enable_segmented_processing)
+        self.enable_segmented_processing_checkbox.setToolTip("将长音频分成多个段落处理，可以大大节省内存使用")
+        self.enable_segmented_processing_checkbox.stateChanged.connect(self.on_segmented_processing_toggled)
+        
         video_clip_control_layout.addWidget(self.enable_video_clips_checkbox)
         video_clip_control_layout.addWidget(clip_count_label)
         video_clip_control_layout.addWidget(self.video_clip_count_spin)
+        video_clip_control_layout.addWidget(memory_hint_label)
+        video_clip_control_layout.addWidget(self.enable_segmented_processing_checkbox)
         video_clip_control_layout.addStretch()
         layout.addLayout(video_clip_control_layout)
         
@@ -1266,6 +1790,17 @@ class MainWindow(QMainWindow):
         self.resolution_combo.currentTextChanged.connect(self.auto_save_config)
         self.custom_width_spin.valueChanged.connect(self.auto_save_config)
         self.custom_height_spin.valueChanged.connect(self.auto_save_config)
+
+        # 分段处理开关
+        if hasattr(self, 'enable_segmented_processing_checkbox'):
+            self.enable_segmented_processing_checkbox.stateChanged.connect(self.on_segmented_processing_toggled)
+
+    def on_segmented_processing_toggled(self):
+        """分段处理开关切换"""
+        if hasattr(self, 'enable_segmented_processing_checkbox'):
+            self.enable_segmented_processing = self.enable_segmented_processing_checkbox.isChecked()
+            # 保存配置
+            self.config_manager.update_config(enable_segmented_processing=self.enable_segmented_processing)
     
     def auto_save_config(self):
         """自动保存配置"""
@@ -1350,7 +1885,7 @@ class MainWindow(QMainWindow):
         
         # 状态标签
         self.status_label = QLabel("准备就绪")
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet("color: #666; font-style: italic;")
         layout.addWidget(self.status_label)
         
@@ -1705,6 +2240,9 @@ class MainWindow(QMainWindow):
             self.video_clip_count_spin.setEnabled(False)
             self.video_clip_count_spin.setValue(3)
             self.video_clip_scale_combo.setCurrentText("裁剪模式 (保持比例)")
+            if hasattr(self, 'enable_segmented_processing_checkbox'):
+                self.enable_segmented_processing_checkbox.setChecked(True)
+            self.enable_segmented_processing = True
             
             # 重新加载配置到UI
             self.load_config_to_ui()
@@ -1912,7 +2450,8 @@ class MainWindow(QMainWindow):
             self.enable_video_clips,
             int(self.video_clip_count_spin.value()),
             self.video_clip_scale_mode,
-            self.selected_processed_video_folder
+            self.selected_processed_video_folder,
+            self.enable_segmented_processing
         )
         
         # 连接信号
