@@ -111,38 +111,58 @@ def safe_write_videofile(video_clip, output_path, fps=24, preset='ultrafast', cr
         process.stdin.close()
         process.wait()
         
-        # 步骤2: 处理音频 - 使用ffmpeg直接提取和合并，避免numpy兼容性问题
+        # 步骤2: 处理音频 - 完全使用ffmpeg处理，避免moviepy音频对象的兼容性问题
         if video_clip.audio is not None:
             try:
-                # 使用moviepy写入临时音频文件，使用write_audiofile避免to_soundarray的numpy问题
-                print(f"DEBUG: 使用moviepy导出音频到临时文件...")
-                video_clip.audio.write_audiofile(
-                    temp_audio,
-                    fps=44100,
-                    nbytes=2,
-                    codec='pcm_s16le',
-                    logger=None,
-                    verbose=False
-                )
+                # 方法1: 尝试使用moviepy导出音频（可能在某些情况下失败）
+                # 方法2: 如果失败，直接用ffmpeg一步完成视频编码和音频合并
+                audio_export_success = False
                 
-                # 验证音频文件是否创建成功
-                if not os.path.exists(temp_audio) or os.path.getsize(temp_audio) == 0:
-                    raise Exception("音频文件创建失败")
+                try:
+                    print(f"DEBUG: 尝试使用moviepy导出音频...")
+                    # 使用try-except包裹，因为在长视频分段处理时可能失败
+                    video_clip.audio.write_audiofile(
+                        temp_audio,
+                        fps=44100,
+                        nbytes=2,
+                        codec='pcm_s16le',
+                        logger=None,
+                        verbose=False
+                    )
+                    
+                    if os.path.exists(temp_audio) and os.path.getsize(temp_audio) > 0:
+                        audio_export_success = True
+                        print(f"DEBUG: 音频文件已创建: {temp_audio}")
+                except Exception as audio_err:
+                    print(f"DEBUG: moviepy音频导出失败: {audio_err}")
+                    audio_export_success = False
                 
-                print(f"DEBUG: 音频文件已创建: {temp_audio}")
-                
-                # 使用ffmpeg合并视频和音频
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-i', temp_video_no_audio,
-                    '-i', temp_audio,
-                    '-c:v', 'copy',  # 直接复制视频流
-                    '-c:a', 'aac',   # 音频编码为AAC
-                    '-b:a', '192k',  # 音频比特率
-                    '-shortest',     # 使用最短的流长度
-                    '-movflags', '+faststart',
-                    output_path
-                ]
+                if audio_export_success:
+                    # 使用已导出的音频文件合并
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-i', temp_video_no_audio,
+                        '-i', temp_audio,
+                        '-c:v', 'copy',  # 直接复制视频流
+                        '-c:a', 'aac',   # 音频编码为AAC
+                        '-b:a', '192k',  # 音频比特率
+                        '-shortest',     # 使用最短的流长度
+                        '-movflags', '+faststart',
+                        output_path
+                    ]
+                else:
+                    # 如果moviepy导出失败，直接使用ffmpeg从临时视频中提取并重新编码
+                    # 注意：这种情况下音频可能已经在temp_video_no_audio中了
+                    print(f"DEBUG: 尝试直接复制临时视频...")
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-i', temp_video_no_audio,
+                        '-c:v', 'copy',
+                        '-c:a', 'aac',
+                        '-b:a', '192k',
+                        '-movflags', '+faststart',
+                        output_path
+                    ]
                 
                 print(f"DEBUG: 执行ffmpeg合并命令...")
                 # 运行ffmpeg，捕获错误输出
@@ -585,8 +605,26 @@ class VideoGenerationWorker(QThread):
         return final_video
     
     def process_segmented_video(self, clips, audio_clip, audio_duration, image_files):
-        """分段处理视频（节省内存）"""
+        """分段处理视频（节省内存）- 使用ffmpeg分割音频避免moviepy进程问题"""
         self.log_updated.emit(f"开始分段处理，音频总时长: {audio_duration:.1f}s")
+        
+        # 步骤1: 先将完整音频导出为临时文件，避免后续subclip时进程失效
+        import tempfile
+        temp_full_audio = os.path.join(tempfile.gettempdir(), f"full_audio_{os.getpid()}.wav")
+        self.log_updated.emit("正在导出完整音频到临时文件...")
+        try:
+            audio_clip.write_audiofile(
+                temp_full_audio,
+                fps=44100,
+                nbytes=2,
+                codec='pcm_s16le',
+                logger=None,
+                verbose=False
+            )
+            self.log_updated.emit(f"✓ 完整音频已导出: {temp_full_audio}")
+        except Exception as e:
+            self.log_updated.emit(f"⚠️ 音频导出失败，将使用无音频模式: {str(e)}")
+            temp_full_audio = None
         
         # 计算分段参数
         segment_duration = 300  # 每段5分钟
@@ -610,9 +648,6 @@ class VideoGenerationWorker(QThread):
             segment_audio_duration = end_time - start_time
             
             self.log_updated.emit(f"处理第 {i+1}/{num_segments} 段: {start_time:.1f}s - {end_time:.1f}s")
-            
-            # 为当前段落创建音频片段
-            segment_audio = audio_clip.subclip(start_time, end_time)
             
             # 为当前段落分配图片片段
             segment_clips = self.allocate_clips_for_segment(clips, segment_audio_duration, i, num_segments)
@@ -639,30 +674,57 @@ class VideoGenerationWorker(QThread):
                     # 缩短视频
                     segment_video = segment_video.subclip(0, segment_audio_duration)
                 
-                # 设置音频并导出为临时文件，释放内存
-                segment_video = segment_video.set_audio(segment_audio)
+                # 导出无音频视频，然后用ffmpeg添加音频
+                temp_video_no_audio = os.path.join(temp_dir, f"segment_{i+1:03d}_noaudio.mp4")
                 temp_path = os.path.join(temp_dir, f"segment_{i+1:03d}.mp4")
-                self.log_updated.emit(f"导出第 {i+1} 段到临时文件: {os.path.basename(temp_path)}")
+                self.log_updated.emit(f"导出第 {i+1} 段视频...")
                 
-                # 使用安全的导出函数
-                safe_write_videofile(
-                    segment_video,
-                    temp_path,
+                # 先导出无音频视频
+                segment_video.write_videofile(
+                    temp_video_no_audio,
                     fps=self.fps,
+                    codec='libx264',
                     preset=self.preset,
-                    crf=23,
-                    threads=self.threads,
-                    audio_codec='aac'
+                    audio=False,
+                    logger=None,
+                    verbose=False,
+                    threads=self.threads
                 )
+                
+                # 使用ffmpeg从完整音频中提取对应时间段并合并
+                if temp_full_audio and os.path.exists(temp_full_audio):
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-i', temp_video_no_audio,
+                        '-ss', str(start_time),
+                        '-t', str(segment_audio_duration),
+                        '-i', temp_full_audio,
+                        '-c:v', 'copy',
+                        '-c:a', 'aac',
+                        '-b:a', '192k',
+                        '-shortest',
+                        temp_path
+                    ]
+                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if result.returncode != 0:
+                        self.log_updated.emit(f"⚠️ 音频合并失败，使用无音频版本")
+                        shutil.copy2(temp_video_no_audio, temp_path)
+                else:
+                    # 没有音频，直接复制
+                    shutil.copy2(temp_video_no_audio, temp_path)
+                
+                # 删除无音频临时文件
+                try:
+                    os.remove(temp_video_no_audio)
+                except:
+                    pass
+                
                 # 关闭释放内存
                 try:
                     segment_video.close()
                 except Exception:
                     pass
-                try:
-                    segment_audio.close()
-                except Exception:
-                    pass
+                
                 temp_segment_paths.append(temp_path)
                 self.temp_segment_files.append(temp_path)
                 
@@ -677,6 +739,13 @@ class VideoGenerationWorker(QThread):
             # 更新进度
             progress = 85 + (i + 1) * 10 // num_segments
             self.progress_updated.emit(progress)
+        
+        # 清理完整音频临时文件
+        if temp_full_audio and os.path.exists(temp_full_audio):
+            try:
+                os.remove(temp_full_audio)
+            except:
+                pass
         
         # 拼接所有段落（基于磁盘文件，内存占用更低）
         if temp_segment_paths:
